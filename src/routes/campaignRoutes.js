@@ -4,6 +4,7 @@ const {
   createCampaign,
   getApprovedCampaigns,
   getTopFundedCampaigns,
+  getCategories,
   getCampaignById,
   getMyCampaigns,
   updateCampaign,
@@ -17,6 +18,7 @@ const { verifyToken, authorizeRoles } = require('../middleware/auth');
 // Public routes
 router.get('/approved', getApprovedCampaigns);
 router.get('/top-funded', getTopFundedCampaigns);
+router.get('/categories', getCategories);
 router.get('/details/:id', getCampaignById);
 
 // Creator routes

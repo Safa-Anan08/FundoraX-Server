@@ -74,6 +74,25 @@ exports.getTopFundedCampaigns = async (req, res) => {
   }
 };
 
+// Get Unique Campaign Categories (Homepage & Filters)
+exports.getCategories = async (req, res) => {
+  try {
+    const rawCategories = await Campaign.distinct('category');
+    // Filter out null, undefined, or empty whitespace strings
+    const categories = rawCategories.filter(
+      (c) => c && typeof c === 'string' && c.trim().length > 0
+    );
+
+    res.json({
+      success: true,
+      count: categories.length,
+      categories,
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
 // Get Single Campaign Details
 exports.getCampaignById = async (req, res) => {
   try {
