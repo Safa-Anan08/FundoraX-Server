@@ -16,10 +16,23 @@ const connectDB = require('./src/config/db');
 
 const app = express();
 
-// Middleware
+// CORS configuration supporting both local development and Vercel production frontend
+const allowedOrigins = [
+  'http://localhost:3000',
+  'https://fundorax-iota.vercel.app',
+  process.env.CLIENT_URL,
+].filter(Boolean);
+
 app.use(
   cors({
-    origin: process.env.CLIENT_URL || 'http://localhost:3000',
+    origin: (origin, callback) => {
+      // Allow requests with no origin (like mobile apps, curl, or server-to-server calls)
+      if (!origin || allowedOrigins.includes(origin)) {
+        callback(null, true);
+      } else {
+        callback(new Error(`CORS policy restriction: origin ${origin} is not allowed`));
+      }
+    },
     credentials: true,
   })
 );
@@ -189,3 +202,4 @@ const startServer = async () => {
 };
 
 startServer();
+
