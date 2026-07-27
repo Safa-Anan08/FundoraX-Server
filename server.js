@@ -110,6 +110,12 @@ app.get('/api/health', (req, res) => {
     timestamp: new Date().toISOString(),
   });
 });
+app.get('/', (req, res) => {
+  res.json({
+    status: 'ok',
+    message: 'FundoraX API Server is running',
+  });
+});
 
 // Global Error Handling Middleware
 app.use((err, req, res, next) => {
