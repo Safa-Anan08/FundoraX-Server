@@ -16,11 +16,23 @@ const connectDB = async () => {
     }
     console.log('[Database] Connecting to MongoDB Atlas...');
     const conn = await mongoose.connect(connStr);
-    console.log(`[Database] MongoDB Connected Successfully: ${conn.connection.host}`);
+    console.log(`[Database Connected] Host: ${conn.connection.host} | DB Name: ${conn.connection.name}`);
+
+    // Listen for database connection events
+    mongoose.connection.on('disconnected', () => {
+      console.warn('[Database Disconnected] Lost connection to MongoDB.');
+    });
+    mongoose.connection.on('reconnected', () => {
+      console.log('[Database Reconnected] Re-established connection to MongoDB.');
+    });
+    mongoose.connection.on('error', (err) => {
+      console.error('[Database Connection Error]', err.message);
+    });
+
     return conn;
   } catch (error) {
-    console.error(`[Database Error] ${error.message}`);
-    throw error; // Throw error so callers know connection failed instead of silently failing
+    console.error(`[Database Connection Failure] ${error.message}`);
+    throw error;
   }
 };
 

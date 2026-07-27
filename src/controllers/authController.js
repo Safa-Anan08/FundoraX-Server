@@ -19,8 +19,10 @@ exports.register = async (req, res) => {
       return res.status(400).json({ success: false, message: 'Name, email, and password are required' });
     }
 
-    const existingUser = await User.findOne({ email: email.toLowerCase() });
+    const cleanEmail = email.toLowerCase().trim();
+    const existingUser = await User.findOne({ email: cleanEmail });
     if (existingUser) {
+      console.warn(`[DB Duplicate Key Warning] Registration rejected for existing email: ${cleanEmail}`);
       return res.status(400).json({ success: false, message: 'User with this email already exists' });
     }
 
@@ -28,17 +30,18 @@ exports.register = async (req, res) => {
     const hashedPassword = await bcrypt.hash(password, salt);
 
     const userRole = role === 'Creator' ? 'Creator' : 'Supporter';
-    // Default initial credits assignment rule: Supporter -> 50, Creator -> 20
     const initialCredits = userRole === 'Creator' ? 20 : 50;
 
     const newUser = await User.create({
-      name,
-      email: email.toLowerCase(),
+      name: name.trim(),
+      email: cleanEmail,
       password: hashedPassword,
       photo: photo || 'https://i.ibb.co/MgsTCzP/default-avatar.png',
       role: userRole,
       credits: initialCredits,
     });
+
+    console.log(`[DB Insert Success] Registered User: ${newUser.email} (ID: ${newUser._id}, Role: ${newUser.role}, Credits: ${newUser.credits})`);
 
     const token = generateToken(newUser);
 
@@ -56,6 +59,11 @@ exports.register = async (req, res) => {
       },
     });
   } catch (error) {
+    if (error.code === 11000) {
+      console.error('[DB Duplicate Error] Mongo E11000 duplicate key on User email:', error.keyValue);
+      return res.status(400).json({ success: false, message: 'User with this email already exists' });
+    }
+    console.error('[DB Insert Failure] Registration error:', error.message);
     res.status(500).json({ success: false, message: error.message });
   }
 };
@@ -69,19 +77,23 @@ exports.login = async (req, res) => {
       return res.status(400).json({ success: false, message: 'Email and password are required' });
     }
 
-    const user = await User.findOne({ email: email.toLowerCase() });
+    const cleanEmail = email.toLowerCase().trim();
+    const user = await User.findOne({ email: cleanEmail });
     if (!user) {
+      console.warn(`[DB Query Warning] Login attempt failed for non-existent email: ${cleanEmail}`);
       return res.status(400).json({ success: false, message: 'Invalid credentials' });
     }
 
     if (user.password) {
       const isMatch = await bcrypt.compare(password, user.password);
       if (!isMatch) {
+        console.warn(`[Auth Warning] Invalid password attempt for email: ${cleanEmail}`);
         return res.status(400).json({ success: false, message: 'Invalid credentials' });
       }
     }
 
     const token = generateToken(user);
+    console.log(`[Auth Success] User logged in: ${user.email} (Role: ${user.role})`);
 
     res.json({
       success: true,
@@ -97,6 +109,7 @@ exports.login = async (req, res) => {
       },
     });
   } catch (error) {
+    console.error('[Auth Error] Login exception:', error.message);
     res.status(500).json({ success: false, message: error.message });
   }
 };
@@ -107,6 +120,7 @@ exports.googleAuth = (req, res) => {
   const callbackUrl = process.env.GOOGLE_CALLBACK_URL || 'http://localhost:5000/api/auth/google/callback';
 
   if (!googleClientId) {
+    console.error('[Google OAuth Error] Missing GOOGLE_CLIENT_ID in server environment');
     return res.status(500).json({ success: false, message: 'Google Client ID is not configured on server' });
   }
 
@@ -132,7 +146,6 @@ exports.googleCallback = async (req, res) => {
 
     const callbackUrl = process.env.GOOGLE_CALLBACK_URL || 'http://localhost:5000/api/auth/google/callback';
 
-    // 1. Exchange auth code for access token
     const tokenResponse = await fetch('https://oauth2.googleapis.com/token', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -147,11 +160,10 @@ exports.googleCallback = async (req, res) => {
 
     const tokenData = await tokenResponse.json();
     if (!tokenData.access_token) {
-      console.error('[Google OAuth Error] Failed to get access token:', tokenData);
+      console.error('[Google OAuth Error] Failed to obtain access token:', tokenData);
       return res.redirect(`${clientUrl}/login?error=${encodeURIComponent('Failed to obtain token from Google')}`);
     }
 
-    // 2. Fetch verified profile from Google UserInfo endpoint
     const userInfoResponse = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
       headers: { Authorization: `Bearer ${tokenData.access_token}` },
     });
@@ -163,27 +175,22 @@ exports.googleCallback = async (req, res) => {
 
     const email = googleUser.email.toLowerCase();
 
-    // 3. Search MongoDB by verified Google email
     let user = await User.findOne({ email });
-
     if (!user) {
-      // NEW USER BUSINESS RULE: MUST ALWAYS be 'Supporter' with exactly 50 credits!
       user = await User.create({
         name: googleUser.name || 'Google User',
         email: email,
         googleId: googleUser.id,
         photo: googleUser.picture || 'https://i.ibb.co/MgsTCzP/default-avatar.png',
-        role: 'Supporter', // MUST ALWAYS be Supporter
-        credits: 50,        // MUST ALWAYS be 50 credits
+        role: 'Supporter',
+        credits: 50,
       });
+      console.log(`[DB Insert Success] Created new Google User: ${user.email} (Credits: 50)`);
+    } else {
+      console.log(`[DB Query Success] Matched existing Google User: ${user.email}`);
     }
-    // EXISTING USER BUSINESS RULE:
-    // Do NOT create duplicate user, do NOT add extra 50 credits, do NOT change existing role/credits!
 
-    // 4. Generate JWT token
     const token = generateToken(user);
-
-    // 5. Redirect browser to frontend with token
     return res.redirect(`${clientUrl}/login?token=${encodeURIComponent(token)}`);
   } catch (error) {
     console.error('[Google Callback Exception]', error);
@@ -200,21 +207,22 @@ exports.googleLogin = async (req, res) => {
       return res.status(400).json({ success: false, message: 'Google account email is required' });
     }
 
-    const cleanEmail = email.toLowerCase();
+    const cleanEmail = email.toLowerCase().trim();
     let user = await User.findOne({ email: cleanEmail });
 
     if (!user) {
-      // NEW USER BUSINESS RULE: MUST ALWAYS be Supporter with 50 credits
       user = await User.create({
         name: name || 'Google User',
         email: cleanEmail,
         googleId,
         photo: photo || 'https://i.ibb.co/MgsTCzP/default-avatar.png',
-        role: 'Supporter', // MUST be Supporter
-        credits: 50,        // MUST be 50
+        role: 'Supporter',
+        credits: 50,
       });
+      console.log(`[DB Insert Success] Created new Google API User: ${user.email}`);
+    } else {
+      console.log(`[DB Query Success] Matched existing Google API User: ${user.email}`);
     }
-    // EXISTING USER: Keep existing user's role and credits, do NOT add extra credits!
 
     const token = generateToken(user);
 
@@ -232,6 +240,7 @@ exports.googleLogin = async (req, res) => {
       },
     });
   } catch (error) {
+    console.error('[Google Login Error]', error.message);
     res.status(500).json({ success: false, message: error.message });
   }
 };
@@ -255,6 +264,7 @@ exports.getMe = async (req, res) => {
       },
     });
   } catch (error) {
+    console.error('[GetMe Error]', error.message);
     res.status(500).json({ success: false, message: error.message });
   }
 };
