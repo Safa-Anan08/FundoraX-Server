@@ -9,27 +9,25 @@ const CREDIT_PACKAGES = {
   'Starter': { credits: 100, priceUSD: 10 },
   'Popular': { credits: 300, priceUSD: 25 },
   'Growth': { credits: 800, priceUSD: 60 },
-  'Premium': { credits: 1500, priceUSD: 110 }
+  'Premium': { credits: 1500, priceUSD: 110 },
 };
 
 // 1. Create Stripe Payment Intent securely
 exports.createPaymentIntent = async (req, res) => {
   try {
     const { packageTitle } = req.body;
-    
-    // Server-side validation of package prevents malicious credit tampering
+
     const pkg = CREDIT_PACKAGES[packageTitle];
     if (!pkg) {
+      console.warn(`[Payment Warning] Invalid package requested: ${packageTitle}`);
       return res.status(400).json({ success: false, message: 'Invalid package selected' });
     }
 
     const { credits, priceUSD: amountUSD } = pkg;
 
-    // Create a PaymentIntent with the exact amount in cents
     const paymentIntent = await stripe.paymentIntents.create({
       amount: Math.round(amountUSD * 100),
       currency: 'usd',
-      // Automatic payment methods let Stripe handle card/apple pay etc
       automatic_payment_methods: {
         enabled: true,
       },
@@ -38,9 +36,11 @@ exports.createPaymentIntent = async (req, res) => {
         userEmail: req.user.email,
         packageTitle: packageTitle,
         credits: String(credits),
-        amountUSD: String(amountUSD)
-      }
+        amountUSD: String(amountUSD),
+      },
     });
+
+    console.log(`[PaymentIntent Created] ID: ${paymentIntent.id} for User: ${req.user.email} ($${amountUSD} USD -> ${credits} Credits)`);
 
     res.json({
       success: true,
@@ -50,95 +50,92 @@ exports.createPaymentIntent = async (req, res) => {
       amountUSD,
     });
   } catch (error) {
+    console.error('[PaymentIntent Error]', error.message);
     res.status(500).json({ success: false, message: error.message });
   }
 };
 
-// 2. Webhook: The ONLY source of truth for adding credits safely
+// Helper function: Process Successful Payment Idempotently
+const processPaymentSuccess = async (paymentIntentId, metadata) => {
+  const existingPayment = await Payment.findOne({ transactionId: paymentIntentId });
+  if (existingPayment) {
+    console.log(`[Payment Idempotency] Transaction ${paymentIntentId} already processed.`);
+    return { success: true, payment: existingPayment, alreadyProcessed: true };
+  }
+
+  const { userId, userEmail, packageTitle, credits, amountUSD } = metadata || {};
+  const creditAmount = Number(credits);
+
+  if (!userId || !creditAmount) {
+    throw new Error('Invalid metadata on PaymentIntent');
+  }
+
+  const user = await User.findById(userId);
+  if (!user) {
+    throw new Error(`User not found for ID ${userId}`);
+  }
+
+  // Atomically add credits
+  user.credits += creditAmount;
+  await user.save();
+
+  // Create Payment Document
+  const payment = await Payment.create({
+    user: user._id,
+    userEmail: userEmail || user.email,
+    packageTitle: packageTitle || 'Credit Top-Up',
+    credits: creditAmount,
+    amountUSD: Number(amountUSD || 0),
+    paymentMethod: 'Stripe',
+    transactionId: paymentIntentId,
+    type: 'credit_purchase',
+    status: 'completed',
+  });
+
+  // Create Notification Document
+  try {
+    await Notification.create({
+      toEmail: userEmail || user.email,
+      message: `Your Stripe payment was successful! Added ${creditAmount} credits for $${amountUSD}.`,
+      actionRoute: '/dashboard/payment-history',
+    });
+  } catch (notifErr) {
+    console.warn('[Notification Warning]', notifErr.message);
+  }
+
+  console.log(`[DB Insert & Credit Update] Added ${creditAmount} credits to ${user.email} (TXN: ${paymentIntentId}). New Balance: ${user.credits}`);
+  return { success: true, payment, user };
+};
+
+// 2. Webhook Handler
 exports.stripeWebhook = async (req, res) => {
   const sig = req.headers['stripe-signature'];
   const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
 
   let event;
   try {
-    // We expect the raw body buffer here, provided by express.raw() in server.js
     event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
   } catch (err) {
-    console.error('[Stripe Webhook Error] Signature verification failed:', err.message);
+    console.error('[Stripe Webhook Signature Error]', err.message);
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
-  // Idempotently handle the event
   if (event.type === 'payment_intent.succeeded') {
     const paymentIntent = event.data.object;
-    
-    // Extract our securely injected metadata
-    const { userId, userEmail, packageTitle, credits, amountUSD } = paymentIntent.metadata;
-    const creditAmount = Number(credits);
-    const transactionId = paymentIntent.id; // Reliable unique Stripe ID
-
     try {
-      // 1. Idempotency Check: Don't process the same payment twice
-      const existingPayment = await Payment.findOne({ transactionId });
-      if (existingPayment) {
-        console.log(`[Webhook Idempotency] Payment ${transactionId} already processed.`);
-        return res.json({ received: true });
-      }
-
-      // 2. Retrieve user
-      const user = await User.findById(userId);
-      if (!user) {
-        console.error(`[Webhook Error] User not found: ${userId}`);
-        return res.status(404).json({ error: 'User not found' });
-      }
-
-      // 3. Atomically add credits
-      user.credits += creditAmount;
-      await user.save();
-
-      // 4. Save Payment Record
-      await Payment.create({
-        user: user._id,
-        userEmail: userEmail,
-        packageTitle: packageTitle,
-        credits: creditAmount,
-        amountUSD: Number(amountUSD),
-        paymentMethod: 'Stripe',
-        transactionId: transactionId,
-        type: 'credit_purchase',
-        status: 'completed',
-      });
-
-      // 5. Notify the user securely
-      try {
-        await Notification.create({
-          toEmail: userEmail,
-          message: `Your Stripe payment was successful! Added ${creditAmount} credits for $${amountUSD}.`,
-          actionRoute: '/dashboard/payment-history',
-        });
-      } catch (notifErr) {
-        console.warn('[Webhook Notification Error]', notifErr.message);
-      }
-
-      console.log(`[Webhook Success] Added ${creditAmount} credits to ${userEmail} (TXN: ${transactionId})`);
+      await processPaymentSuccess(paymentIntent.id, paymentIntent.metadata);
     } catch (err) {
-      console.error('[Webhook Processing Error]', err);
+      console.error('[Webhook Processing Error]', err.message);
       return res.status(500).json({ error: 'Database processing failed' });
     }
   } else if (event.type === 'payment_intent.payment_failed') {
-     console.log(`[Webhook Info] Payment Intent failed: ${event.data.object.id}`);
-     // Optionally log failed payment record to database, but DO NOT add credits.
-  } else if (event.type === 'payment_intent.canceled') {
-     console.log(`[Webhook Info] Payment Intent canceled: ${event.data.object.id}`);
+    console.log(`[Webhook Event] Payment Intent failed: ${event.data.object.id}`);
   }
 
-  // Return a 200 response to acknowledge receipt of the event
   res.json({ received: true });
 };
 
-// 3. Confirm Credit Purchase (Frontend fallback/polling handler)
-// We keep this endpoint so the frontend can check if the credit was successfully added
-// without relying purely on WebSockets. It will not add credits itself anymore.
+// 3. Confirm Credit Purchase (Frontend sync handler)
 exports.confirmCreditPurchase = async (req, res) => {
   try {
     const { paymentIntentId } = req.body;
@@ -146,40 +143,41 @@ exports.confirmCreditPurchase = async (req, res) => {
       return res.status(400).json({ success: false, message: 'Payment Intent ID required' });
     }
 
-    // Check if the webhook already processed it
-    const existingPayment = await Payment.findOne({ transactionId: paymentIntentId });
+    let existingPayment = await Payment.findOne({ transactionId: paymentIntentId });
     if (existingPayment) {
       const user = await User.findById(req.user.id);
       return res.json({
         success: true,
         message: 'Payment successfully processed!',
-        credits: user.credits,
+        credits: user ? user.credits : 0,
         payment: existingPayment,
       });
     }
 
-    // If it hasn't processed, retrieve from Stripe to check status
+    // Retrieve from Stripe if Webhook hasn't arrived yet
     const intent = await stripe.paymentIntents.retrieve(paymentIntentId);
-    
     if (intent.status === 'succeeded') {
-       // Wait a moment in case webhook is slightly behind
-       return res.json({ 
-         success: true, 
-         message: 'Payment succeeded, verifying via webhook...',
-         pendingWebhook: true
-       });
+      const result = await processPaymentSuccess(intent.id, intent.metadata);
+      const user = await User.findById(req.user.id);
+      return res.json({
+        success: true,
+        message: 'Payment verified and credits added successfully!',
+        credits: user ? user.credits : 0,
+        payment: result.payment,
+      });
     } else {
-       return res.status(400).json({ 
-         success: false, 
-         message: `Payment status is ${intent.status}. Credits not added.` 
-       });
+      return res.status(400).json({
+        success: false,
+        message: `Payment status is ${intent.status}. Credits not added.`,
+      });
     }
   } catch (error) {
+    console.error('[Confirm Credit Purchase Error]', error.message);
     res.status(500).json({ success: false, message: error.message });
   }
 };
 
-// Get User Payment History
+// 4. Get User Payment History
 exports.getPaymentHistory = async (req, res) => {
   try {
     const payments = await Payment.find({ userEmail: req.user.email }).sort({ date: -1 });
@@ -189,7 +187,7 @@ exports.getPaymentHistory = async (req, res) => {
   }
 };
 
-// Get Supporter Credit Wallet Summary
+// 5. Get Supporter Credit Wallet Summary
 exports.getWalletSummary = async (req, res) => {
   try {
     const user = await User.findById(req.user.id);
@@ -197,17 +195,14 @@ exports.getWalletSummary = async (req, res) => {
       return res.status(404).json({ success: false, message: 'User not found' });
     }
 
-    // Aggregate total credits purchased
     const payments = await Payment.find({ userEmail: user.email, type: 'credit_purchase', status: 'completed' });
     const totalPurchased = payments.reduce((acc, p) => acc + (p.credits || 0), 0);
 
-    // Aggregate total credits contributed
     const contributions = await Contribution.find({ supporterEmail: user.email });
     const totalContributed = contributions
       .filter((c) => c.status !== 'rejected')
       .reduce((acc, c) => acc + (c.contributionAmount || 0), 0);
 
-    // Aggregate total credits refunded
     const totalRefunded = contributions
       .filter((c) => c.status === 'rejected')
       .reduce((acc, c) => acc + (c.contributionAmount || 0), 0);
